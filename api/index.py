@@ -1,33 +1,36 @@
 """
-Telegram Flask webhook-бот для развертывания на Vercel как serverless-функция.
-Каждый входящий POST-запрос от Telegram обрабатывается как отдельный вызов функции.
-Никаких polling-циклов — чисто обработка через вебхуки.
+Telegram Flask webhook-бот для Vercel serverless.
+Фикс: отключено threading, обработчики выполняются синхронно,
+пока send_message не дойдёт до Telegram, 200 не возвращается.
 """
 
 import os
+import logging
 import telebot
 from flask import Flask, request, jsonify
 
 # ---------------------------------------------------------------------------
-# Инициализация приложения и бота
+# Логирование — чтобы в логах Vercel видеть реальные ошибки, а не пустоту
 # ---------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 app = Flask(__name__)
 
-# Токен берется из переменных окружения Vercel.
-# Запасной вариант — пустая строка, чтобы модуль импортировался даже если
-# окружение настроено криво (Vercel соберёт функцию, но обработчики упадут
-# в рантайме, пока реальный токен не будет указан в
-# Settings → Environment Variables).
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
+# КЛЮЧЕВОЙ ФИКС: отключаем потоки. В serverless каждый обработчик
+# должен выполниться синхронно внутри вызова функции, иначе Vercel
+# убьёт инстанс до того, как bot.send_message дойдёт до Telegram API.
+bot.threaded = False
+
 # ---------------------------------------------------------------------------
-# Обработчики бота — здесь пишется логика диалога
+# Обработчики бота
 # ---------------------------------------------------------------------------
 
 @bot.message_handler(commands=["start"])
 def handle_start(message):
-    """Приветствие при команде /start."""
     bot.send_message(
         message.chat.id,
         f"Привет, {message.from_user.first_name}! ⚡\n"
@@ -49,7 +52,6 @@ def handle_help(message):
 
 @bot.message_handler(func=lambda m: True, content_types=["text"])
 def handle_text(message):
-    """Обработчик-заглушка: повторяет любой текст обратно."""
     bot.send_message(message.chat.id, f"Ты сказал: {message.text}")
 
 
@@ -59,11 +61,6 @@ def handle_text(message):
 
 @app.route("/", methods=["POST"])
 def webhook():
-    """
-    Сюда Telegram присылает обновления. Мы десериализуем JSON в объект
-    Update из telebot, передаём его в диспетчер и сразу возвращаем 200 OK,
-    чтобы Telegram не пытался повторить запрос.
-    """
     if not request.is_json:
         return jsonify({"error": "expected application/json"}), 400
 
@@ -71,17 +68,15 @@ def webhook():
     if payload is None:
         return jsonify({"error": "invalid JSON"}), 400
 
-    # Оборачиваем сырой JSON в Update из telebot и запускаем обработку синхронно.
-    # process_new_updates выполняет все подходящие обработчики inline,
-    # поэтому к моменту return ответ уже отправлен в Telegram.
     update = telebot.types.Update.de_json(payload)
     try:
+        # С threaded=False это блокирующий вызов. Он не вернётся,
+        # пока обработчик полностью не отработает, включая bot.send_message.
         bot.process_new_updates([update])
     except Exception as exc:
-        # Пишем в логи Vercel, но всё равно возвращаем 200 для Telegram.
-        # Если вернуть не 200, Telegram будет повторять тот же апдейт до 7 раз,
-        # что почти никогда не нужно — пользователи получат дубли ответов.
-        app.logger.error("Ошибка при обработке апдейта: %s", exc)
+        # Логируем полный traceback в логи Vercel, чтобы видеть реально что падает.
+        # 200 всё равно возвращаем — иначе Телеграм будет повторять апдейт 7 раз.
+        logger.exception("Ошибка при обработке апдейта: %s", exc)
         return "OK", 200
 
     return "OK", 200
@@ -89,19 +84,40 @@ def webhook():
 
 @app.route("/", methods=["GET"])
 def health():
-    """Простая проверка живости — можно дёрнуть в браузере и убедиться, что бот жив."""
-    return jsonify({"status": "running", "bot_configured": bool(BOT_TOKEN)}), 200
+    """Проверка живости + видно, задан ли токен."""
+    return jsonify({
+        "status": "running",
+        "bot_configured": bool(BOT_TOKEN),
+        "threading_disabled": not bot.threaded
+    }), 200
+
+
+@app.route("/debug", methods=["GET"])
+def debug():
+    """
+    Дёргает getMe у Telegram, чтобы проверить, реально ли токен работает
+    в текущем окружении Vercel. Если вернулся 200 с данными бота — всё ок.
+    """
+    if not BOT_TOKEN:
+        return jsonify({"error": "BOT_TOKEN не задан в env"}), 500
+    try:
+        me = bot.get_me()
+        return jsonify({
+            "ok": True,
+            "bot_username": me.username,
+            "bot_first_name": me.first_name
+        }), 200
+    except Exception as exc:
+        logger.exception("getMe упал: %s", exc)
+        return jsonify({"error": str(exc)}), 500
 
 
 # ---------------------------------------------------------------------------
-# Локальный запуск — Vercel в serverless-режиме это игнорирует.
+# Локальный запуск
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Только для локальной разработки. В проде Vercel импортирует `app` напрямую.
-    # Чтобы запустить локально: задай переменную окружения BOT_TOKEN,
-    # выполни `python api/index.py`, затем туннель через ngrok или `vercel dev`.
     if BOT_TOKEN:
-        bot.remove_webhook()  # сбрасываем старый вебхук перед локальным поллингом
+        bot.remove_webhook()
         bot.infinity_polling()
     else:
         app.run(host="0.0.0.0", port=3000, debug=True)
