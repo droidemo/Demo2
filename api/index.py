@@ -95,7 +95,7 @@ def create_invoice(amount: str, order_id: str) -> dict | None:
     payload = {
         "price_amount": amount,
         "price_currency": "usd",
-        "pay_currency": "usdttrc20",  # Фиксируем USDT TRC20
+        "pay_currency": "usdttrc20",
         "order_id": order_id,
         "order_description": PRODUCT_NAME,
         "ipn_callback_url": f"{WEBHOOK_BASE_URL}/payment-webhook",
@@ -109,10 +109,13 @@ def create_invoice(amount: str, order_id: str) -> dict | None:
 
     try:
         resp = requests.post(url, json=payload, headers=headers, timeout=10)
+        # Если код не 200, выводим тело ошибки в логи Vercel!
+        if resp.status_code != 200:
+            logger.error("NOWPayments API error %s: %s", resp.status_code, resp.text)
         resp.raise_for_status()
         return resp.json()
     except requests.RequestException as e:
-        logger.error("NOWPayments API error: %s", e)
+        logger.error("NOWPayments request failed: %s", e)
         return None
 
 # ===========================================================================
